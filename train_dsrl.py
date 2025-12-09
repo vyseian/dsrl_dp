@@ -25,6 +25,9 @@ OmegaConf.register_new_resolver("round_up", math.ceil)
 OmegaConf.register_new_resolver("round_down", math.floor)
 
 base_path = os.path.dirname(os.path.abspath(__file__))
+# Make diffusion_policy importable without moving files
+import sys, os
+sys.path.append(os.path.join(base_path, "..", "diffusion_policy"))
 
 	
 
@@ -38,6 +41,8 @@ def main(cfg: OmegaConf):
 	random.seed(cfg.seed)
 	np.random.seed(cfg.seed)
 	torch.manual_seed(cfg.seed)
+
+	cfg.use_wandb = False
 
 	if cfg.use_wandb:
 		wandb.init(
@@ -57,12 +62,31 @@ def main(cfg: OmegaConf):
 			env = gym.make(cfg.env_name)
 			env = ObservationWrapperGym(env, cfg.normalization_path)
 		elif cfg.env_name in ['lift', 'can', 'square', 'transport']:
-			env = make_robomimic_env(env=cfg.env_name, normalization_path=cfg.normalization_path, low_dim_keys=cfg.env.wrappers.robomimic_lowdim.low_dim_keys, dppo_path=cfg.dppo_path)
+			env = make_robomimic_env(env=cfg.env_name, 
+							normalization_path=cfg.normalization_path, 
+							low_dim_keys=cfg.env.wrappers.robomimic_lowdim.low_dim_keys, 
+							dppo_path=cfg.dppo_path, 
+							abs_action=cfg.env.wrappers.robomimic_lowdim.get("abs_action", False),)
 			env = ObservationWrapperRobomimic(env, reward_offset=cfg.env.reward_offset)
 		env = ActionChunkWrapper(env, cfg, max_episode_steps=cfg.env.max_episode_steps)
 		return env
 
 	base_policy = load_base_policy(cfg)
+	# print(type(base_policy))
+	# exit()
+
+	# determine diffusion action dims (T, D)
+	if getattr(cfg, "policy", None) is not None:
+		act_steps = getattr(cfg.policy, "n_action_steps", None) or getattr(cfg.policy, "horizon", None)
+		# action_dim = getattr(cfg.policy, "action_dim", None) or getattr(cfg, "action_dim", None)
+		action_dim = getattr(cfg, "action_dim", None)
+	else:
+		act_steps = getattr(cfg, "act_steps", None)
+		action_dim = getattr(cfg, "action_dim", None)
+
+	diffusion_act_dim = (int(act_steps), int(action_dim))
+	print(diffusion_act_dim)
+
 	env = make_vec_env(make_env, n_envs=num_env, vec_env_cls=SubprocVecEnv)
 	if cfg.algorithm == 'dsrl_sac':
 		env = DiffusionPolicyEnvWrapper(env, cfg, base_policy)
@@ -127,7 +151,8 @@ def main(cfg: OmegaConf):
 			verbose=1,
 			policy_kwargs=policy_kwargs,
 			diffusion_policy=base_policy,
-			diffusion_act_dim=(cfg.act_steps, cfg.action_dim),
+			# diffusion_act_dim=(cfg.act_steps, cfg.action_dim),
+			diffusion_act_dim=diffusion_act_dim,
 			noise_critic_grad_steps=cfg.train.noise_critic_grad_steps,
 			critic_backup_combine_type=cfg.train.critic_backup_combine_type,
 		)

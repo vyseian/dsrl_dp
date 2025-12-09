@@ -15,7 +15,7 @@ import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
 
 
-def make_robomimic_env(render=False, env='square', normalization_path=None, low_dim_keys=None, dppo_path=None):
+def make_robomimic_env(render=False, env='square', normalization_path=None, low_dim_keys=None, dppo_path=None, abs_action=False):
 	wrappers = OmegaConf.create({
 		'robomimic_lowdim': {
 			'normalization_path': normalization_path,
@@ -40,6 +40,17 @@ def make_robomimic_env(render=False, env='square', normalization_path=None, low_
 	robomimic_env_cfg_path = f'{dppo_path}/cfg/robomimic/env_meta/{env}.json'
 	with open(robomimic_env_cfg_path, "r") as f:
 		env_meta = json.load(f)
+
+	# Apply absolute-action override (diffusion_policy does this in its runner)
+	if abs_action:
+		env_meta.setdefault('env_kwargs', {})
+		ctrl = env_meta['env_kwargs'].setdefault('controller_configs', {})
+		# set control_delta False to get absolute (non-delta) actions
+		ctrl['control_delta'] = False
+
+		# optional: if you need rotation transformer info like diffusion_policy does,
+		# set a flag in env_meta or handle it where needed.
+
 	env_meta["reward_shaping"] = False
 	env = EnvUtils.create_env_from_metadata(
 		env_meta=env_meta,
