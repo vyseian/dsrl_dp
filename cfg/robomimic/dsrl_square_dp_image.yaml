@@ -42,10 +42,10 @@ env:
   wrappers:
     robomimic_lowdim:
       normalization_path: ${normalization_path}
-      low_dim_keys: ['robot0_eef_pos',
+      low_dim_keys: ['object',
+                    'robot0_eef_pos',
                     'robot0_eef_quat',
-                    'robot0_gripper_qpos',
-                    'object'] 
+                    'robot0_gripper_qpos'] 
     multi_step:
       n_obs_steps: ${cond_steps}
       n_action_steps: ${act_steps}

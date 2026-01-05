@@ -92,6 +92,10 @@ class ObservationWrapperRobomimic(gym.Env):
 
 	def step(self, action):
 		raw_obs, reward, done, info = self.env.step(action)
+		is_success = info.get('is_success', False)
+		if reward == 1.0:
+			is_success = True
+		info['is_success'] = is_success
 		reward = (reward - self.reward_offset)
 		obs = raw_obs['state'].flatten()
 		return obs, reward, done, info
@@ -177,9 +181,12 @@ class ActionChunkWrapper(gymnasium.Env):
 		done_ = []
 		info_ = []
 		done_i = False
+		chunk_success = False
 		for i in range(action.shape[0]):
 			self.count += 1
 			obs_i, reward_i, done_i, info_i = self.env.step(action[i])
+			if info_i.get('is_success', False):
+				chunk_success = True
 			obs_.append(obs_i)
 			reward_.append(reward_i)
 			done_.append(done_i)
@@ -188,6 +195,7 @@ class ActionChunkWrapper(gymnasium.Env):
 		reward = sum(reward_)
 		done = np.max(done_)
 		info = info_[-1]
+		info['episode_success'] = chunk_success
 		if self.count >= self.max_episode_steps:
 			done = True
 		if done:
@@ -239,4 +247,3 @@ class DiffusionPolicyEnvWrapper(VecEnvWrapper):
 		self.obs = torch.tensor(obs, device=self.device, dtype=torch.float32)
 		obs_out = self.obs
 		return obs_out.detach().cpu().numpy()
-	

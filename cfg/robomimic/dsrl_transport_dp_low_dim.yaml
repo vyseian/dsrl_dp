@@ -12,7 +12,7 @@ dppo_path: ./dppo
 
 algorithm: dsrl_sac
 
-seed: 1
+seed: ???
 device: cuda:0
 use_wandb: True
 env_name: transport
@@ -32,7 +32,7 @@ save_replay_buffer: False
 
 env:
   n_envs:  4
-  n_eval_envs: 25
+  n_eval_envs: 28
   name: ${env_name}
   max_episode_steps: 800
   reset_at_iteration: False
@@ -42,13 +42,14 @@ env:
   wrappers:
     robomimic_lowdim:
       normalization_path: ${normalization_path}
-      low_dim_keys: ['robot0_eef_pos',
+      low_dim_keys: ['object',
+                    'robot0_eef_pos',
                     'robot0_eef_quat',
                     'robot0_gripper_qpos',
                     "robot1_eef_pos",
                     "robot1_eef_quat",
-                    "robot1_gripper_qpos",
-                    'object'] 
+                    "robot1_gripper_qpos"] 
+      abs_action: true
     multi_step:
       n_obs_steps: ${cond_steps}
       n_action_steps: ${act_steps}
@@ -83,7 +84,6 @@ model:
   predict_epsilon: True
   denoised_clip_value: 1.0
   randn_clip_value: 3
-  #
   network_path: ${base_policy_path}
   network:
     _target_: model.diffusion.mlp_diffusion.DiffusionMLP

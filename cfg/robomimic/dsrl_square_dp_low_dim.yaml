@@ -8,16 +8,18 @@ name: robomimic_square_dsrl_${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 logdir: ${log_dir}/robomimic-dsrl/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 base_policy_path: ./dppo/log/robomimic-pretrain/square/square_pre_diffusion_mlp_ta4_td100_ddim-100steps/2025-04-11_19-13-26_44/checkpoint/state_3000.pt
 offline_data_path: ./dppo/log/robomimic/square_traj_data/train_offline.npz
-normalization_path: ./dppo/log/robomimic/${env_name}/normalization.npz
+normalization_path: null
 dppo_path: ./dppo
+
+checkpoint_path: /home/vyseian/GitHub/dsrl/logs/robomimic-dsrl/robomimic_square_dsrl_2025-12-23_12-28-59_5923/2025-12-23_12-28-59_5923/checkpoint/final.zip
 
 algorithm: dsrl_na
 
-seed: 1
+seed: ???
 device: cuda:0
 use_wandb: True
 env_name: square
-log_dir: ./logs 
+log_dir: ./logs  
 obs_dim: 23
 action_dim: 7 # Automatically deal with abs_action in env wrapper
 cond_steps: 1
@@ -32,20 +34,21 @@ save_replay_buffer: False
 
 env:
   n_envs:  4
-  n_eval_envs: 25
+  n_eval_envs: 28
   name: ${env_name}
   max_episode_steps: 400
   reset_at_iteration: False
   save_video: False
   best_reward_threshold_for_success: 1 
-  reward_offset: 1
+  reward_offset: 1 ####
   wrappers:
     robomimic_lowdim:
       normalization_path: ${normalization_path}
-      low_dim_keys: ['robot0_eef_pos',
+      low_dim_keys: ['object',
+                    'robot0_eef_pos',
                     'robot0_eef_quat',
                     'robot0_gripper_qpos',
-                    'object'] 
+                    ] 
       abs_action: true
     multi_step:
       n_obs_steps: ${cond_steps}

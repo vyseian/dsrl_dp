@@ -30,7 +30,7 @@ import sys, os
 sys.path.append(os.path.join(base_path, "..", "diffusion_policy"))
 
 	
-# nohup python train_dsrl.py --config-path=cfg/robomimic --config-name=dsrl_square.yaml 
+
 
 @hydra.main(
 	config_path=os.path.join(base_path, "cfg/robomimic"), config_name="dsrl_can.yaml", version_base=None
@@ -130,33 +130,34 @@ def main(cfg: OmegaConf):
 			policy_kwargs=policy_kwargs,
 		)
 	elif cfg.algorithm == 'dsrl_na':
-		model = DSRL(
-			"MlpPolicy",
-			env,
-			learning_rate=cfg.train.actor_lr,
-			buffer_size=10000000,      # Replay buffer size
-			learning_starts=1,    # How many steps before learning starts (total steps for all env combined)
-			batch_size=cfg.train.batch_size,
-			tau=cfg.train.tau,                # Target network update rate
-			gamma=cfg.train.discount,               # Discount factor
-			train_freq=cfg.train.train_freq,             # Update the model every train_freq steps
-			gradient_steps=cfg.train.utd,         # How many gradient steps to do at each update
-			action_noise=None,        # No additional action noise
-			optimize_memory_usage=False,
-			ent_coef="auto" if cfg.train.ent_coef == -1 else cfg.train.ent_coef,          # Automatic entropy tuning
-			target_update_interval=1, # Update target network every interval
-			target_entropy="auto" if cfg.train.target_ent == -1 else cfg.train.target_ent,    # Automatic target entropy
-			use_sde=False,
-			sde_sample_freq=-1,
-			tensorboard_log=cfg.logdir,
-			verbose=1,
-			policy_kwargs=policy_kwargs,
-			diffusion_policy=base_policy,
-			# diffusion_act_dim=(cfg.act_steps, cfg.action_dim),
-			diffusion_act_dim=diffusion_act_dim,
-			noise_critic_grad_steps=cfg.train.noise_critic_grad_steps,
-			critic_backup_combine_type=cfg.train.critic_backup_combine_type,
-		)
+		checkpoint_path = getattr(cfg, "checkpoint_path", None)
+		
+		if checkpoint_path and os.path.exists(checkpoint_path):
+			print(f"Loading pre-trained DSRL model from: {checkpoint_path}")
+            # Use the .load() method. Note that we pass the new env and 
+            # any updated parameters (like diffusion_policy) manually.
+			model = DSRL.load(
+                checkpoint_path,
+                env=env,
+				custom_objects={
+					"diffusion_policy": base_policy,
+					# Force these specific attributes to these specific values
+					"diffusion_act_chunk": diffusion_act_dim[0], # e.g., 8
+					"diffusion_act_dim":   diffusion_act_dim[1], # e.g., 7
+				},
+                device=cfg.device, # Ensure it loads to the right device
+            )
+		else:
+			print("Initializing new DSRL model.")
+			model = DSRL(
+                "MlpPolicy",
+                env,
+                # ... (rest of your existing initialization arguments)
+                diffusion_policy=base_policy,
+                diffusion_act_dim=diffusion_act_dim,
+                noise_critic_grad_steps=cfg.train.noise_critic_grad_steps,
+                critic_backup_combine_type=cfg.train.critic_backup_combine_type,
+            )
 
 	checkpoint_callback = CheckpointCallback(
 		save_freq=cfg.save_model_interval, 
@@ -187,36 +188,10 @@ def main(cfg: OmegaConf):
 		max_steps=MAX_STEPS,
 		deterministic_eval=cfg.deterministic_eval,
 	)
-
-	import time
-
-	start = time.time()
-
 	logging_callback.evaluate(model, deterministic=False)
 	if cfg.deterministic_eval:
 		logging_callback.evaluate(model, deterministic=True)
 	logging_callback.log_count += 1
-
-	end = time.time()
-	print(end - start)
-	exit()
-
-	if cfg.load_offline_data:
-		load_offline_data(model, cfg.offline_data_path, num_env)
-	if cfg.train.init_rollout_steps > 0:
-		collect_rollouts(model, env, cfg.train.init_rollout_steps, base_policy, cfg)	
-		logging_callback.set_timesteps(cfg.train.init_rollout_steps * num_env)
-
-	callbacks = [checkpoint_callback, logging_callback]
-	# Train the agent
-	model.learn(
-		total_timesteps=20000000,
-		callback = callbacks
-	)
-
-	# Save the final model
-	if len(cfg.name) > 0:
-		model.save(cfg.logdir+"/checkpoint/final")
 
 	# Close environment and wandb
 	env.close()

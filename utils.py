@@ -6,63 +6,125 @@ import hydra
 import os
 from typing import Union
 from scipy.spatial.transform import Rotation
+import torch.nn.functional as F
 
-# Lightweight RotationTransformer without pytorch3d dependency
 class RotationTransformer:
     """
-    Minimal rotation transformer: converts between axis-angle (3D) and rotation_6d (6D).
-    Uses scipy.spatial.transform.Rotation for the heavy lifting.
+    Torch-only minimal transformer that converts between:
+      - axis-angle (rotation vector, shape (...,3)) and
+      - rotation_6d (first two rows of rotation matrix flattened, shape (...,6))
+    Keeps tensors on-device (no numpy/scipy roundtrips).
     """
-    def __init__(self, from_rep='axis_angle', to_rep='rotation_6d'):
-        assert from_rep in ['axis_angle', 'rotation_6d']
-        assert to_rep in ['axis_angle', 'rotation_6d']
-        assert from_rep != to_rep
-        self.from_rep = from_rep
-        self.to_rep = to_rep
 
-    def forward(self, x: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
-        """Convert from_rep -> to_rep."""
-        is_numpy = isinstance(x, np.ndarray)
-        if isinstance(x, torch.Tensor):
-            x = x.cpu().numpy() if x.is_cuda else x.numpy()
+    @staticmethod
+    def axis_angle_to_rot6d(rotvec: torch.Tensor) -> torch.Tensor:
+        # rotvec: (..., 3)
 
-        # Flatten to (N, 3) or (N, 6)
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, orig_shape[-1])
+        # --- START OF PYTORCH3D LOGIC (Adapted from axis_angle_to_matrix) ---
 
-        if self.from_rep == 'axis_angle' and self.to_rep == 'rotation_6d':
-            # axis_angle (3,) -> rotation matrix (3,3) -> 6D (first two rows)
-            rot = Rotation.from_rotvec(x_flat)
-            mat = rot.as_matrix()  # (N, 3, 3)
-            rot6d = mat[:, :2, :].reshape(mat.shape[0], 6)  # (N, 6)
-        elif self.from_rep == 'rotation_6d' and self.to_rep == 'axis_angle':
-            # 6D (first two rows) -> rotation matrix (3,3) -> axis_angle (3,)
-            rot6d = x_flat  # (N, 6)
-            mat = np.zeros((rot6d.shape[0], 3, 3), dtype=rot6d.dtype)
-            mat[:, :2, :] = rot6d.reshape(rot6d.shape[0], 2, 3)
-            # Compute third row via cross product to ensure orthogonality
-            mat[:, 2, :] = np.cross(mat[:, 0, :], mat[:, 1, :])
-            rot = Rotation.from_matrix(mat)
-            axis_angle = rot.as_rotvec()  # (N, 3)
-            rot6d = axis_angle
-        else:
-            raise ValueError(f"Unsupported conversion: {self.from_rep} -> {self.to_rep}")
+        axis_angle = rotvec
+        shape = axis_angle.shape
+        device, dtype = axis_angle.device, axis_angle.dtype
+        
+        # 1. Angles / Magnitude
+        angles = torch.norm(axis_angle, p=2, dim=-1, keepdim=True).unsqueeze(-1)
+        
+        # 2. Skew-Symmetric Matrix (K)
+        rx, ry, rz = axis_angle[..., 0], axis_angle[..., 1], axis_angle[..., 2]
+        zeros = torch.zeros(shape[:-1], dtype=dtype, device=device)
+        
+        # PyTorch3D K (cross_product_matrix) construction:
+        K = torch.stack(
+            [zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=-1
+        ).view(shape + (3,))
+        
+        K_sqrd = K @ K # K^2
+        
+        # 3. Coefficients and Final Matrix (R)
+        identity = torch.eye(3, dtype=dtype, device=device)
+        angles_sqrd = angles * angles
+        angles_sqrd = torch.where(angles_sqrd == 0, 1, angles_sqrd) # Handles theta=0
+        
+        # Rodrigues Formula: R = I + sinc(theta/pi)*K + ((1-cos(theta))/theta^2)*K^2
+        R = (
+            identity.expand(K.shape)
+            + torch.sinc(angles / torch.pi) * K
+            + ((1 - torch.cos(angles)) / angles_sqrd) * K_sqrd
+        )
 
-        result = rot6d if self.from_rep == 'axis_angle' else rot6d
-        result = result.reshape(orig_shape[:-1] + (result.shape[-1],))
+        # --- END OF PYTORCH3D LOGIC ---
 
-        if is_numpy:
-            return result
-        else:
-            return torch.from_numpy(result).float()
+        # 4. Final step: Convert Matrix (R) to 6D
+        # The 6D representation is the first two rows flattened.
+        # Note: R.shape is (..., 3, 3). We extract R[..., :2, :]
+        batch_dim = R.size()[:-2]
+        rot6 = R[..., :2, :].reshape(batch_dim + (6,))
+        
+        return rot6
 
-    def inverse(self, x: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
-        """Convert to_rep -> from_rep (inverse of forward)."""
-        # Swap reps and call forward
-        self.from_rep, self.to_rep = self.to_rep, self.from_rep
-        result = self.forward(x)
-        self.from_rep, self.to_rep = self.to_rep, self.from_rep
-        return result
+    @staticmethod
+    def rot6d_to_axis_angle(rot6: torch.Tensor) -> torch.Tensor:
+        # rot6: (..., 6)
+
+        # --- START OF PYTORCH3D LOGIC (Adapted from rotation_6d_to_matrix) ---
+        d6 = rot6
+        
+        # 1. 6D -> Matrix (Gram-Schmidt process from PyTorch3D)
+        a1, a2 = d6[..., :3], d6[..., 3:]
+        b1 = F.normalize(a1, dim=-1) # F.normalize from torch.nn.functional
+        b2 = a2 - (b1 * a2).sum(-1, keepdim=True) * b1
+        b2 = F.normalize(b2, dim=-1)
+        b3 = torch.cross(b1, b2, dim=-1)
+        R = torch.stack((b1, b2, b3), dim=-2) # R is the 3x3 rotation matrix
+
+        # --- END OF PYTORCH3D rotation_6d_to_matrix ---
+
+        # --- START OF PYTORCH3D LOGIC (Adapted from matrix_to_axis_angle, fast=True) ---
+        matrix = R
+        
+        # 2. Matrix -> Axis-Angle (PyTorch3D's direct formula)
+        
+        # Calculate omegas (axis vector components scaled by 2*sin(theta))
+        omegas = torch.stack(
+            [
+                matrix[..., 2, 1] - matrix[..., 1, 2],
+                matrix[..., 0, 2] - matrix[..., 2, 0],
+                matrix[..., 1, 0] - matrix[..., 0, 1],
+            ],
+            dim=-1,
+        )
+        norms = torch.norm(omegas, p=2, dim=-1, keepdim=True)
+        traces = torch.diagonal(matrix, dim1=-2, dim2=-1).sum(-1).unsqueeze(-1)
+        
+        # Calculate angle theta
+        angles = torch.atan2(norms, traces - 1)
+
+        zeros = torch.zeros(3, dtype=matrix.dtype, device=matrix.device)
+        omegas = torch.where(torch.isclose(angles, torch.zeros_like(angles), atol=1e-8), zeros, omegas)
+
+        near_pi = angles.isclose(angles.new_full((1,), torch.pi)).squeeze(-1)
+
+        axis_angles = torch.empty_like(omegas)
+        axis_angles[~near_pi] = (
+            0.5 * omegas[~near_pi] / torch.sinc(angles[~near_pi] / torch.pi)
+        )
+
+        # Handle theta near PI (requires matrix decomposition)
+        # This section handles the singularity at pi/180 degrees where the trace is -1
+        n = 0.5 * (
+            matrix[near_pi][..., 0, :]
+            + torch.eye(1, 3, dtype=matrix.dtype, device=matrix.device)
+        )
+        # Normalization factor for the axis at pi
+        norm_n = torch.norm(n, dim=-1, keepdim=True)
+        # Apply a small epsilon to prevent division by zero in case of zero vector
+        norm_n = torch.where(norm_n == 0, 1e-8, norm_n) 
+        
+        axis_angles[near_pi] = angles[near_pi] * n / norm_n
+
+        # --- END OF PYTORCH3D matrix_to_axis_angle (fast=True) ---
+
+        return axis_angles
 
 class DPPOBasePolicyWrapper:
 	def __init__(self, base_policy):
@@ -125,16 +187,12 @@ class GenericDPWrapper:
         except Exception:
             pass
 
-        # rotation transformers (axis-angle <-> rotation_6d)
-        self._rot_axis_to_6d = None
-        self._rot_6d_to_axis = None
+        # Rotation transformers (Torch implementation above)
         try:
-            # RotationTransformer implemented earlier in this file (scipy-based)
-            self._rot_axis_to_6d = RotationTransformer(from_rep='axis_angle', to_rep='rotation_6d')
-            self._rot_6d_to_axis = RotationTransformer(from_rep='rotation_6d', to_rep='axis_angle')
-        except Exception:
-            self._rot_axis_to_6d = None
-            self._rot_6d_to_axis = None
+            self._rot_axis_to_6d = RotationTransformer  # use static methods
+            self._rot_6d_to_axis = RotationTransformer
+        except Exception as e:
+            raise RuntimeError("Failed to initialize RotationTransformer") from e
 
     def _to_tensor(self, x, dtype=torch.float32):
         if isinstance(x, np.ndarray):
@@ -163,33 +221,40 @@ class GenericDPWrapper:
             raise RuntimeError(f"GenericDPWrapper: unexpected obs tensor shape {obs_t.shape}; expected (B,Do) or (B,To,Do)")
 
         B, To, Do = obs_t.shape
-
-        # initialize obs buffer for this batch size if needed
         if self.obs_buffer is None or self.obs_buffer.shape[0] != B:
-            # start with zeros and fill the last slot(s) with the first obs batch
             self.obs_buffer = torch.zeros(B, self.n_obs_steps, Do, device=self.device, dtype=torch.float32)
-            # place the incoming obs at the end (so the first call uses last slot(s) = current obs)
             if To >= self.n_obs_steps:
+                # If we have enough incoming steps, use the last N steps (no change needed here)
                 self.obs_buffer[:] = obs_t[:, -self.n_obs_steps:, :].to(self.device, dtype=torch.float32)
             else:
-                self.obs_buffer[:, -To:, :] = obs_t.to(self.device, dtype=torch.float32)
+                # Case where To < self.n_obs_steps (e.g., first single step obs)
+                
+                # 1. Fill the tail with the available obs (this is the current step, To=1)
+                current_obs_data = obs_t.to(self.device, dtype=torch.float32)
+                self.obs_buffer[:, -To:, :] = current_obs_data 
 
+                # 2. Duplicate the *oldest* incoming observation (the first one) to fill the buffer head.
+                # The oldest incoming observation is at index 0 of the incoming obs_t.
+                # In the single-step case (To=1), this is the current observation.
+                padding_obs = current_obs_data[:, 0, :].unsqueeze(1) # (B, 1, Do)
+                padding_length = self.n_obs_steps - To 
+                
+                # Expand the single observation across the padding length
+                expanded_padding = padding_obs.expand(B, padding_length, Do)
+                
+                # Fill the head of the buffer with the expanded padding
+                self.obs_buffer[:, :padding_length, :] = expanded_padding
         else:
-            # shift and append current obs_t (handles To == 1 or larger)
             if To >= self.n_obs_steps:
-                # latest To contains at least n_obs_steps; take last n_obs_steps directly
-                self.obs_buffer = obs_t[:, -self.n_obs_steps:, :].to(self.device, dtype=torch.float32)
+                # replace whole buffer with last n_obs_steps of incoming obs
+                self.obs_buffer[:] = obs_t[:, -self.n_obs_steps:, :].to(self.device, dtype=torch.float32)
             else:
-                # drop oldest `To` frames and append current `To` frames
-                self.obs_buffer = torch.cat([self.obs_buffer[:, To:, :], obs_t.to(self.device, dtype=torch.float32)], dim=1)
+                # shift left by To without allocating, then write
+                self.obs_buffer[:, :self.n_obs_steps - To, :] = self.obs_buffer[:, To:, :]
+                self.obs_buffer[:, self.n_obs_steps - To :, :] = obs_t.to(self.device, dtype=torch.float32)
 
         # use the stacked observations for the policy
         stacked_obs = self.obs_buffer  # (B, n_obs_steps, Do)
-
-        # Deterministic: best-effort by seeding torch RNG locally
-        if deterministic:
-            torch_state = torch.get_rng_state()
-            torch.manual_seed(0)
 
         # If an initial action (env-format) is provided, convert env->policy format if needed
         if initial_noise is not None:
@@ -204,11 +269,9 @@ class GenericDPWrapper:
                     grip = init_t[..., 6:7]
                     flat_rot = rot_axis.contiguous().view(-1, 3)
                     if self._rot_axis_to_6d is None:
-                        raise RuntimeError("RotationTransformer (axis->6d) not available for env->policy conversion")
-                    conv = self._rot_axis_to_6d.forward(flat_rot)
-                    if isinstance(conv, np.ndarray):
-                        conv = torch.from_numpy(conv)
-                    conv = conv.to(device=self.device, dtype=torch.float32)
+                        raise RuntimeError("RotationTransformer (axis->6d) not available")
+                    # Call Torch transformer; ensure input on device
+                    conv = self._rot_axis_to_6d.axis_angle_to_rot6d(flat_rot.to(self.device, dtype=torch.float32))
                     rot6 = conv.view(rot_axis.shape[0], rot_axis.shape[1], 6)
                     initial_noise = torch.cat([pos, rot6, grip], dim=-1)
                 # dual-arm 14 -> 20
@@ -225,10 +288,7 @@ class GenericDPWrapper:
                         flat_rot = rot_axis.contiguous().view(-1, 3)
                         if self._rot_axis_to_6d is None:
                             raise RuntimeError("RotationTransformer (axis->6d) not available for env->policy conversion")
-                        conv = self._rot_axis_to_6d.forward(flat_rot)
-                        if isinstance(conv, np.ndarray):
-                            conv = torch.from_numpy(conv)
-                        conv = conv.to(device=self.device, dtype=torch.float32)
+                        conv = self._rot_axis_to_6d.axis_angle_to_rot6d(flat_rot.to(self.device, dtype=torch.float32))
                         rot6 = conv.view(B_, T_, 6)
                         arm_conv = torch.cat([pos, rot6, grip], dim=-1)
                         out_arms.append(arm_conv)
@@ -238,12 +298,27 @@ class GenericDPWrapper:
                     initial_noise = init_t
             else:
                 initial_noise = init_t
+            
+            target_horizon = self.base_policy.horizon
+            current_length = initial_noise.shape[1]
+            Da = initial_noise.shape[-1]
+            
+            if current_length < target_horizon:
+                padding_length = target_horizon - current_length
+                padding = torch.zeros(
+                	(B, padding_length, Da),
+                	device=self.device,
+                	dtype=initial_noise.dtype,
+                )
+                
+                initial_noise = torch.cat([initial_noise, padding], dim=1)
 
         # call the canonical DP API using stacked_obs
         with torch.no_grad():
             if hasattr(self.base_policy, "predict_action"):
                 obs_dict = {"obs": stacked_obs}
-                result = self.base_policy.predict_action(obs_dict)
+                # result = self.base_policy.predict_action(obs_dict=obs_dict)
+                result = self.base_policy.predict_action(obs_dict=obs_dict, initial_trajectory=initial_noise)
                 if isinstance(result, dict) and "action" in result:
                     action_t = result["action"]
                 else:
@@ -255,9 +330,6 @@ class GenericDPWrapper:
                     action_t = getattr(result, "trajectories", result)
                 except Exception as e:
                     raise RuntimeError("GenericDPWrapper: unable to call base_policy. Inspect object API.") from e
-
-        if deterministic:
-            torch.set_rng_state(torch_state)
 
         # ensure torch tensor and correct device/dtype
         if isinstance(action_t, np.ndarray):
@@ -288,10 +360,7 @@ class GenericDPWrapper:
                 flat_rot6 = rot6.contiguous().view(-1, 6)
                 if self._rot_6d_to_axis is None:
                     raise RuntimeError("RotationTransformer (6d->axis) not available for policy->env conversion")
-                conv = self._rot_6d_to_axis.forward(flat_rot6)
-                if isinstance(conv, np.ndarray):
-                    conv = torch.from_numpy(conv)
-                conv = conv.to(device=self.device, dtype=torch.float32)
+                conv = self._rot_6d_to_axis.rot6d_to_axis_angle(flat_rot6.to(self.device, dtype=torch.float32))
                 axis = conv.view(rot6.shape[0], rot6.shape[1], 3)
                 action_t = torch.cat([pos, axis, grip], dim=-1)
             # dual arm 20 -> 14
@@ -307,10 +376,7 @@ class GenericDPWrapper:
                     flat_rot6 = rot6.contiguous().view(-1, 6)
                     if self._rot_6d_to_axis is None:
                         raise RuntimeError("RotationTransformer (6d->axis) not available for policy->env conversion")
-                    conv = self._rot_6d_to_axis.forward(flat_rot6)
-                    if isinstance(conv, np.ndarray):
-                        conv = torch.from_numpy(conv)
-                    conv = conv.to(device=self.device, dtype=torch.float32)
+                    conv = self._rot_6d_to_axis.rot6d_to_axis_angle(flat_rot6.to(self.device, dtype=torch.float32))
                     axis = conv.view(rot6.shape[0], rot6.shape[1], 3)
                     out_arms.append(torch.cat([pos, axis, grip], dim=-1))
                 action_t = torch.cat(out_arms, dim=-1)
@@ -585,11 +651,16 @@ class LoggingCallback(BaseCallback):
 		if self.eval_episodes > 0:
 			env = self.eval_env
 			with torch.no_grad():
+				success_count = 0
+				attempt_count = 0
 				success, rews = [], []
 				rew_total, total_ep = 0, 0
 				rew_ep = np.zeros(self.num_eval_env)
 				for i in range(self.eval_episodes):
-					agent.diffusion_policy.reset_buffer()
+					try:
+						agent.diffusion_policy.reset_buffer()
+					except:
+						pass
 					obs = env.reset()
 					success_i = np.zeros(obs.shape[0])
 					r = []
@@ -606,10 +677,16 @@ class LoggingCallback(BaseCallback):
 						total_ep += np.sum(done)
 						success_i[reward > -self.rew_offset] = 1
 						r.append(reward)
+					r_grid = np.stack(r)
+					attempt_count += r_grid.shape[1]
+					success_mask = np.any(r_grid > -8, axis=0)
+					success_count += np.sum(success_mask)
 					success.append(success_i.mean())
 					rews.append(np.mean(np.array(r)))
 					print(f'eval episode {i} at timestep {self.total_timesteps}')
+				print(attempt_count, success_count, success_count/attempt_count)
 				success_rate = np.mean(success)
+				print(success_rate)
 				if total_ep > 0:
 					avg_rew = rew_total / total_ep
 				else:
@@ -634,7 +711,10 @@ class LoggingCallback(BaseCallback):
 
 
 def collect_rollouts(model, env, num_steps, base_policy, cfg):
-	base_policy.reset_buffer()
+	try:
+		base_policy.reset_buffer()
+	except:
+		pass
 	obs = env.reset()
 	for i in range(num_steps):
 		noise = torch.randn(cfg.env.n_envs, cfg.act_steps, cfg.action_dim).to(device=cfg.device)

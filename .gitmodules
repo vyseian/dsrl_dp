@@ -4,3 +4,5 @@
 [submodule "dppo"]
 	path = dppo
 	url = git@github.com:ajwagen/dppo-dsrl.git
+[submodule "stable-baselines3/"]
+	url = https://github.com/vyseian/stable-baselines3-dsrl_dp.git
